@@ -45,7 +45,10 @@ import {
   groqClient,
   SALESFORCE_MCP_URL,
   INSTANCE_ID,
-  bc
+  bc,
+  MODEL_DISCOVERY,
+  MODEL_EXTRACTOR,
+  MODEL_COMPRESSOR
 } from "./config.js";
 import {
   getSalesforceSessionId,
@@ -67,6 +70,34 @@ import {
   connectToSignalingWebSocket,
   connectToMediaWebSocket
 } from "./websocket-utils.js";
+
+// Helper function to broadcast progress updates to SSE clients
+function broadcastProgress(message, type = 'progress') {
+  const progressTranscript = {
+    user_id: 'groq-ai',
+    user_name: 'Groq AI Assistant',
+    data: message,
+    timestamp: Date.now(),
+    processing: true,
+    type: type
+  };
+  
+  // Broadcast to SSE clients
+  for (const client of sseClients) {
+    try {
+      client.send('event: progress\n' + 'data: ' + JSON.stringify({
+        content: progressTranscript
+      }) + '\n\n');
+    } catch (error) {
+      console.error('Error broadcasting progress:', error);
+    }
+  }
+  
+  // Store for polling clients
+  addToRecentTranscripts(progressTranscript);
+  
+  return progressTranscript;
+}
 import {
   UNIFIED_TOOL_REGISTRY,
   addTool,
@@ -454,6 +485,32 @@ app.get('/api/poll-transcripts', (c) => {
   });
 });
 
+// Tool Registry API - Exposes the unified tool registry for frontend
+app.get('/api/tools/registry', (c) => {
+  // Build a simplified registry for frontend display purposes
+  const simplifiedRegistry = {};
+  
+  for (const [toolId, tool] of Object.entries(UNIFIED_TOOL_REGISTRY)) {
+    simplifiedRegistry[toolId] = {
+      id: tool.id,
+      displayName: tool.displayName,
+      type: tool.type,
+      category: tool.category,
+      namespace: tool.namespace,
+      description: tool.description,
+      // For MCP tools, include server label for matching
+      ...(tool.type === 'mcp' && {
+        server_label: tool.server_label
+      })
+    };
+  }
+  
+  return c.json({
+    registry: simplifiedRegistry,
+    timestamp: Date.now()
+  });
+});
+
 // Salesforce MCP Credential Management Endpoints
 app.get('/api/salesforce/status', getSalesforceStatus);
 app.get('/api/salesforce/oauth-url', getSalesforceOAuthUrl);
@@ -665,7 +722,15 @@ app.post('/api/trigger-groq', async (c) => {
     console.log(`\n   🚀 About to call performGroqInference...\n`);
 
     // Process the inference (skip trigger detection since frontend already validated)
-    const result = await performGroqInference(transcript, user_name || 'Unknown', context || 'meeting_transcript', filteredChatHistory, true);
+    // Pass progress callback to broadcast status updates
+    const result = await performGroqInference(
+      transcript, 
+      user_name || 'Unknown', 
+      context || 'meeting_transcript', 
+      filteredChatHistory, 
+      true,
+      broadcastProgress // Pass the progress callback
+    );
 
     // Create response transcript for SSE broadcast
     const responseTranscript = {
@@ -822,10 +887,12 @@ Available tools:
 - Weather: Get current weather conditions for mentioned locations
 - Groq Compound (Web Search): FAST web search for current information about topics, companies, people, events, or trends. This uses groq/compound model which searches the web instantly. Use this for ANY web search needs.
 - HuggingFace: Find AI models or datasets if AI/ML topics are discussed
+- Salesforce: Search and retrieve CRM data about leads, contacts, accounts, opportunities, notes, and tasks. ONLY use when user explicitly mentions a person's name, company name, or asks to search Salesforce records.
 
 **IMPORTANT**: 
 - Discovery Mode does NOT have access to parallel_search (too slow/expensive)
 - Use "groq_compound" for all web searches - it's much faster and perfect for quick discovery insights
+- Use "salesforce" ONLY when user explicitly mentions searching for or finding specific people/companies in CRM
 - Keep insights short and relevant
 
 Your task:
@@ -833,20 +900,33 @@ Your task:
 2. Identify if that specific message mentions a topic that could benefit from additional context
 3. Suggest 0-1 insight to discover (MAXIMUM 1!)
 
-**CRITICAL RULES**:
+**CRITICAL RULES - BE VERY SELECTIVE**:
+- Default to "should_discover": false unless there's a VERY CLEAR need
 - Suggest ONLY 1 insight maximum
 - Focus EXCLUSIVELY on the [NEWEST] message
 - Ignore all older messages - even if they seem related
+- DO NOT suggest insights for general questions, casual conversation, or clarifications
+- ONLY suggest insights when the user explicitly asks for current/external information
 - DO NOT suggest weather unless the [NEWEST] message explicitly asks about weather/temperature
-- Only suggest an insight if it would genuinely add value
+- DO NOT suggest web searches for topics the AI can answer from general knowledge
+- DO NOT suggest Salesforce unless user explicitly mentions a person/company name to look up
+
+ONLY suggest insights for:
+- Explicit requests for current/real-time information (news, events, trends)
+- Specific weather queries ("what's the weather in...")
+- Specific person/company lookups in Salesforce ("find Bob Jones", "search for Acme Corp")
+- AI/ML model searches when user asks to find specific models
 
 Don't suggest insights for:
+- General knowledge questions (AI can answer without tools)
+- Casual conversation or greetings
+- Clarification questions
+- Follow-up questions about previous topics
 - Topics from old messages (anything NOT marked [NEWEST])
 - Questions that were already answered
-- Topics already covered in previous discovery insights  
-- Weather (unless [NEWEST] message explicitly asks "what's the weather")
+- Topics already covered in previous discovery insights
 - Trivial information
-- Topics that don't need external context
+- Topics that don't need external/real-time context
 
 Respond in JSON format:
 {
@@ -856,18 +936,18 @@ Respond in JSON format:
       "topic": "what to discover",
       "reasoning": "why this would be valuable",
       "suggested_query": "specific query to use",
-      "tool": "weather|groq_compound|huggingface"
+      "tool": "weather|groq_compound|huggingface|salesforce"
     }
   ]
 }`;
 
     const discoveryResponse = await groqClient.chat.completions.create({
-      model: "openai/gpt-oss-20b", // Using faster 20b model for quick analysis
+      model: MODEL_DISCOVERY,
       messages: [
-        { role: "system", content: `You are a discovery analysis AI that identifies opportunities for providing helpful background information. Today's date is ${today}.` },
+        { role: "system", content: `You are a highly selective discovery analysis AI. Default to "should_discover": false. ONLY suggest insights when users explicitly request current/external information. Be very conservative - most messages don't need discovery. Today's date is ${today}.` },
         { role: "user", content: discoveryPrompt }
       ],
-      temperature: 0.1,
+      temperature: 0.05,
       max_tokens: 500
     });
 
@@ -935,7 +1015,7 @@ Rules:
 Output format: [Single factual sentence]`;
 
           const researcherResponse = await groqClient.chat.completions.create({
-            model: "openai/gpt-oss-20b", // Using faster 20b model for quick fact extraction
+            model: MODEL_EXTRACTOR,
             messages: [
               { role: "system", content: `You are a fact extractor. Extract ONLY the single most important fact. Maximum 20 words. No preamble, no explanation, just the fact. Today's date is ${today}.` },
               { role: "user", content: researcherPrompt }
@@ -956,7 +1036,7 @@ Output format: [Single factual sentence]`;
 Remove any fluff. Keep only the core fact.`;
 
           const finalDistillationResponse = await groqClient.chat.completions.create({
-            model: "openai/gpt-oss-20b", // Using faster 20b model - good enough for compression
+            model: MODEL_COMPRESSOR,
             messages: [
               { role: "system", content: `You are a text compressor. Output ONLY 1 sentence, max 15 words. Today's date is ${today}.` },
               { role: "user", content: finalDistillationPrompt }

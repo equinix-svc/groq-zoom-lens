@@ -7,14 +7,16 @@
 
 import { getAvailableTools } from "./tool-registry-unified.js";
 
-// Groq client will be injected from main.js
+// Groq client and config will be injected from main.js
 let groqClient = null;
 let SALESFORCE_MCP_URL = null;
+let MODEL_ROUTER = "openai/gpt-oss-20b"; // Default fallback
 
 // Initialize with groq client and config
 export function initializeRouter(client, config) {
   groqClient = client;
   SALESFORCE_MCP_URL = config.SALESFORCE_MCP_URL;
+  MODEL_ROUTER = config.MODEL_ROUTER || "openai/gpt-oss-20b";
 }
 
 // Enhanced AI-powered router that decides which tools and specific MCP functions to use
@@ -228,7 +230,7 @@ Response: {
 Now analyze the user's question and return ONLY valid JSON:`;
 
     const response = await groqClient.chat.completions.create({
-      model: "openai/gpt-oss-20b",
+      model: MODEL_ROUTER,
       messages: [
         {
           role: "system",
@@ -336,93 +338,3 @@ Now analyze the user's question and return ONLY valid JSON:`;
     };
   }
 }
-
-// Correct common misspellings of "Groq" to ensure system works
-export function correctGroqSpelling(text) {
-  if (!text) return text;
-
-  // Common misspellings and variations to correct
-  const corrections = [
-    // Exact word replacements (case-sensitive for proper nouns)
-    { from: /\bgrok\b/gi, to: 'Groq' },
-    { from: /\bgrock\b/gi, to: 'Groq' },
-    { from: /\bgroq\b/g, to: 'Groq' },
-    { from: /\bGrok\b/g, to: 'Groq' },
-    { from: /\bGrock\b/g, to: 'Groq' },
-
-    // Contextual corrections for phrases
-    { from: /hey\s+grok/gi, to: 'Hey Groq' },
-    { from: /hey\s+grock/gi, to: 'Hey Groq' },
-    { from: /hi\s+grok/gi, to: 'Hey Groq' },
-    { from: /hello\s+grok/gi, to: 'Hey Groq' },
-
-    // Handle cases where "groq" appears without "hey"
-    { from: /^\s*grok\s+/gi, to: 'Groq ' },
-    { from: /^\s*grock\s+/gi, to: 'Groq ' },
-  ];
-
-  let correctedText = text;
-
-  // Apply all corrections
-  corrections.forEach(correction => {
-    correctedText = correctedText.replace(correction.from, correction.to);
-  });
-
-  // More specific Brock vs Grok handling
-  if (correctedText.includes('Brock') && !correctedText.toLowerCase().includes('hugging')) {
-    correctedText = correctedText.replace(/\bBrock\b/g, 'Groq');
-  }
-
-  // Add Hugging Face corrections
-  correctedText = correctedText
-    .replace(/\bhugging\s+clothes?\b/gi, 'Hugging Face')
-    .replace(/\bhuging\s+face\b/gi, 'Hugging Face')
-    .replace(/\bhuggingface\b/gi, 'Hugging Face')
-    .replace(/\bhugging\s+face\b/gi, 'Hugging Face');
-
-  return correctedText;
-}
-
-// Detect if text contains "Hey Groq" trigger using simple detection
-export function detectGroqTrigger(text) {
-  // Normalize common misspellings first
-  const normalized = correctGroqSpelling(text || '');
-
-  // Robust detection for "Hey Groq" with optional punctuation and spacing
-  const canonical = normalized
-    .toLowerCase()
-    .replace(/[.,!?;:]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  // Common greeting words that can trigger Groq
-  const GREETINGS = ['hey', 'hi', 'hello', 'yo', 'sup', 'what\'s up', 'greetings'];
-
-  // Allow up to N words between greeting and "groq" (either order)
-  const MAX_WORD_GAP = 6;
-
-  // Build regex patterns for all greetings
-  const greetingPatterns = GREETINGS.map(greeting => {
-    // Escape special regex characters in greetings
-    const escapedGreeting = greeting.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Pattern for greeting then groq (with optional words in between)
-    const greetingThenGroq = new RegExp(`\\b${escapedGreeting}\\b(?:\\s+\\S+){0,${MAX_WORD_GAP}}\\s+\\bgroq\\b`, 'i');
-    // Pattern for groq then greeting (with optional words in between)
-    const groqThenGreeting = new RegExp(`\\bgroq\\b(?:\\s+\\S+){0,${MAX_WORD_GAP}}\\s+\\b${escapedGreeting}\\b`, 'i');
-    return { greetingThenGroq, groqThenGreeting };
-  });
-
-  // Test all greeting patterns
-  const hasGreetingTrigger = greetingPatterns.some(patterns =>
-    patterns.greetingThenGroq.test(canonical) || patterns.groqThenGreeting.test(canonical)
-  );
-
-  const hasTrigger = hasGreetingTrigger ||
-                     /^groq\b/.test(canonical) ||
-                     /\bheygroq\b/i.test(canonical);
-
-  console.log(`🎤 Trigger detection for: "${text}" -> ${hasTrigger ? '✅ DETECTED' : '❌ NOT DETECTED'}`);
-
-  return hasTrigger;
-}
-
